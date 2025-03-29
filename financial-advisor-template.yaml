@@ -1,0 +1,717 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for Financial Advisor AI API infrastructure'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: FinancialAdvisorAI
+    Description: Name of the project
+  
+  Stage:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - prod
+    Description: Deployment stage
+  
+  UserPoolDomainName:
+    Type: String
+    Default: financialadvisor
+    Description: Domain prefix for Cognito user pool
+
+  AdminEmail:
+    Type: String
+    Description: Email address for the initial admin user
+
+Resources:
+  # ========================================================================
+  # DynamoDB Tables
+  # ========================================================================
+  ClientsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${ProjectName}-Clients-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: clientId
+          AttributeType: S
+        - AttributeName: advisorId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: clientId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: AdvisorIndex
+          KeySchema:
+            - AttributeName: advisorId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Stage
+          Value: !Ref Stage
+
+  PortfoliosTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${ProjectName}-Portfolios-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: portfolioId
+          AttributeType: S
+        - AttributeName: clientId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: portfolioId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: ClientIndex
+          KeySchema:
+            - AttributeName: clientId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Stage
+          Value: !Ref Stage
+
+  RecommendationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${ProjectName}-Recommendations-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: recommendationId
+          AttributeType: S
+        - AttributeName: clientId
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: recommendationId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: ClientIndex
+          KeySchema:
+            - AttributeName: clientId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Stage
+          Value: !Ref Stage
+
+  # ========================================================================
+  # S3 Bucket for Reports
+  # ========================================================================
+  ReportsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${ProjectName}-reports-${Stage}-${AWS::AccountId}
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToGlacierAfterOneYear
+            Status: Enabled
+            Transitions:
+              - StorageClass: GLACIER
+                TransitionInDays: 365
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Stage
+          Value: !Ref Stage
+
+  # ========================================================================
+  # Cognito User Pool for Authentication
+  # ========================================================================
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${ProjectName}-user-pool-${Stage}
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      AutoVerifiedAttributes:
+        - email
+      MfaConfiguration: 'OFF'
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+        - Name: name
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+        - Name: phone_number
+          AttributeDataType: String
+          Mutable: true
+          Required: false
+      UsernameAttributes:
+        - email
+      UserPoolAddOns:
+        AdvancedSecurityMode: AUDIT
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Stage
+          Value: !Ref Stage
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub ${UserPoolDomainName}-${Stage}
+      UserPoolId: !Ref UserPool
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub ${ProjectName}-app-client-${Stage}
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      AllowedOAuthFlows:
+        - implicit
+        - code
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes:
+        - phone
+        - email
+        - openid
+        - profile
+      CallbackURLs:
+        - http://localhost:3000
+        - !Sub https://${CloudFrontDistribution.DomainName}
+      LogoutURLs:
+        - http://localhost:3000
+        - !Sub https://${CloudFrontDistribution.DomainName}
+      SupportedIdentityProviders:
+        - COGNITO
+
+  # ========================================================================
+  # IAM Roles
+  # ========================================================================
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-lambda-role-${Stage}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt ClientsTable.Arn
+                  - !GetAtt PortfoliosTable.Arn
+                  - !GetAtt RecommendationsTable.Arn
+                  - !Sub ${ClientsTable.Arn}/index/*
+                  - !Sub ${PortfoliosTable.Arn}/index/*
+                  - !Sub ${RecommendationsTable.Arn}/index/*
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ReportsBucket.Arn
+                  - !Sub ${ReportsBucket.Arn}/*
+
+  # ========================================================================
+  # Lambda Functions
+  # ========================================================================
+  ClientsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-clients-${Stage}
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+            // This is a placeholder. Replace with actual code deployment
+            return {
+              statusCode: 200,
+              headers: {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*'
+              },
+              body: JSON.stringify({ message: 'Clients API placeholder' })
+            };
+          };
+      Environment:
+        Variables:
+          CLIENTS_TABLE: !Ref ClientsTable
+          STAGE: !Ref Stage
+      Timeout: 30
+      MemorySize: 256
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Stage
+          Value: !Ref Stage
+
+  PortfoliosFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-portfolios-${Stage}
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+            // This is a placeholder. Replace with actual code deployment
+            return {
+              statusCode: 200,
+              headers: {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*'
+              },
+              body: JSON.stringify({ message: 'Portfolios API placeholder' })
+            };
+          };
+      Environment:
+        Variables:
+          PORTFOLIOS_TABLE: !Ref PortfoliosTable
+          CLIENTS_TABLE: !Ref ClientsTable
+          STAGE: !Ref Stage
+      Timeout: 30
+      MemorySize: 256
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Stage
+          Value: !Ref Stage
+
+  RecommendationsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-recommendations-${Stage}
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+            // This is a placeholder. Replace with actual code deployment
+            return {
+              statusCode: 200,
+              headers: {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*'
+              },
+              body: JSON.stringify({ message: 'Recommendations API placeholder' })
+            };
+          };
+      Environment:
+        Variables:
+          RECOMMENDATIONS_TABLE: !Ref RecommendationsTable
+          CLIENTS_TABLE: !Ref ClientsTable
+          REPORTS_BUCKET: !Ref ReportsBucket
+          STAGE: !Ref Stage
+      Timeout: 30
+      MemorySize: 256
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Stage
+          Value: !Ref Stage
+
+  # ========================================================================
+  # API Gateway
+  # ========================================================================
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub ${ProjectName}-api-${Stage}
+      Description: API for Financial Advisor AI application
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Stage
+          Value: !Ref Stage
+
+  ApiGatewayAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: CognitoUserPoolAuthorizer
+      Type: COGNITO_USER_POOLS
+      IdentitySource: method.request.header.Authorization
+      RestApiId: !Ref ApiGateway
+      ProviderARNs:
+        - !GetAtt UserPool.Arn
+
+  # API Gateway Resources
+  ClientsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: clients
+
+  ClientResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref ClientsResource
+      PathPart: '{clientId}'
+
+  PortfoliosResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: portfolios
+
+  PortfolioResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref PortfoliosResource
+      PathPart: '{portfolioId}'
+
+  ClientPortfoliosResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref ClientResource
+      PathPart: portfolios
+
+  RecommendationsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: recommendations
+
+  RecommendationResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref RecommendationsResource
+      PathPart: '{recommendationId}'
+
+  ClientRecommendationsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref ClientResource
+      PathPart: recommendations
+
+  # API Methods - Clients
+  ClientsGet:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ClientsResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref ApiGatewayAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ClientsFunction.Arn}/invocations
+
+  ClientsPost:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ClientsResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref ApiGatewayAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ClientsFunction.Arn}/invocations
+
+  ClientGet:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ClientResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref ApiGatewayAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ClientsFunction.Arn}/invocations
+
+  ClientPut:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ClientResource
+      HttpMethod: PUT
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref ApiGatewayAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ClientsFunction.Arn}/invocations
+
+  ClientDelete:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ClientResource
+      HttpMethod: DELETE
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref ApiGatewayAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ClientsFunction.Arn}/invocations
+
+  # API Methods - Portfolios (similar pattern for other endpoints)
+  PortfoliosGet:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref PortfoliosResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref ApiGatewayAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PortfoliosFunction.Arn}/invocations
+
+  # Deployment & Stage
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ClientsGet
+      - ClientsPost
+      - ClientGet
+      - ClientPut
+      - ClientDelete
+      - PortfoliosGet
+    Properties:
+      RestApiId: !Ref ApiGateway
+      Description: !Sub ${ProjectName} API deployment
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      DeploymentId: !Ref ApiDeployment
+      RestApiId: !Ref ApiGateway
+      StageName: !Ref Stage
+      MethodSettings:
+        - ResourcePath: /*
+          HttpMethod: '*'
+          MetricsEnabled: true
+          LoggingLevel: INFO
+          DataTraceEnabled: false
+          ThrottlingBurstLimit: 5000
+          ThrottlingRateLimit: 10000
+
+  # ========================================================================
+  # Lambda Permissions
+  # ========================================================================
+  ClientsLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ClientsFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*
+
+  PortfoliosLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PortfoliosFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*
+
+  RecommendationsLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref RecommendationsFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*
+
+  # ========================================================================
+  # CloudFront for frontend distribution
+  # ========================================================================
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${ProjectName}-frontend-${Stage}-${AWS::AccountId}
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Stage
+          Value: !Ref Stage
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub ${FrontendBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}
+
+  CloudFrontOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${ProjectName}-OAC-${Stage}
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Origins:
+          - DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            Id: S3Origin
+            OriginAccessControlId: !GetAtt CloudFrontOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        Enabled: true
+        DefaultRootObject: index.html
+        DefaultCacheBehavior:
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          TargetOriginId: S3Origin
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+        PriceClass: PriceClass_100
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+        CustomErrorResponses:
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+        Tags:
+          - Key: Project
+            Value: !Ref ProjectName
+          - Key: Stage
+            Value: !Ref Stage
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Stage}
+    Export:
+      Name: !Sub ${ProjectName}-ApiEndpoint-${Stage}
+
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub ${ProjectName}-UserPoolId-${Stage}
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub ${ProjectName}-UserPoolClientId-${Stage}
+
+  CloudFrontURL:
+    Description: CloudFront Distribution URL
+    Value: !Sub https://${CloudFrontDistribution.DomainName}
+    Export:
+      Name: !Sub ${ProjectName}-CloudFrontURL-${Stage}
+
+  ReportsBucketName:
+    Description: S3 Bucket for reports
+    Value: !Ref ReportsBucket
+    Export:
+      Name: !Sub ${ProjectName}-ReportsBucket-${Stage}
+
+  FrontendBucketName:
+    Description: S3 Bucket for frontend
+    Value: !Ref FrontendBucket
+    Export:
+      Name: !Sub ${ProjectName}-FrontendBucket-${Stage}
